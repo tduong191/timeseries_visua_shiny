@@ -1,0 +1,203 @@
+## R Markdown
+
+#Packages
+```{r}
+library(lubridate)
+library(magrittr)
+library(stringr)
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(ggvis)
+library(Hmisc)
+```
+
+#Functions
+```{r}
+first_positive <- function(x) {
+  first(which(x == "Duong tinh"))
+}
+last_test <- function(x) {
+  last(which(!is.na(x)))
+}
+```
+
+use province home and first_positive
+#Load data
+
+```{r}
+fixed_data <- readxl::read_excel("~/OneDrive - TnS/OUCRU/Covid-19/linelisting_1903/Pha_n\ ti_ch\ ca\ du_o_ng\ ti_nh\ COVID-19-3.xlsx")
+dict <- readxl::read_excel("~/OneDrive - TnS/OUCRU/Covid-19/linelisting_1903/dictionary_covid.xlsx")
+province <- readxl::read_excel("~/OneDrive - TnS/OUCRU/Covid-19/linelisting_1903/province.xlsx")
+```
+
+Edit Province
+```{r}
+province <- province %>% 
+  mutate(Population = stringr::str_remove_all(Population, paste0("\\[[:digit:]+\\]|\\,"))) %>% 
+  mutate(Population = as.integer(Population))
+```
+
+Translate the columns
+```{r}
+dict <- dict %>% 
+  mutate(`Variable name (Viet)` = stringr::str_replace_all(`Variable name (Viet)`,"\n", "")) #clean columns
+
+colnames(fixed_data) <- stringr::str_replace_all(colnames(fixed_data), "\r\n", "") #clean columns
+
+colnames(fixed_data) <- dict$`Variable after fixed and translated`
+
+```
+
+
+
+Remove unnecessary columns (note "remove" in dictionary_covid.xlsx)
+```{r, warning=FALSE}
+remov <- dict$`Variable after fixed and translated`[dict$Note == "remove"] 
+remove <- remov[which(remov != "NA")]
+
+fixed_data <- fixed_data %>%
+  select(-c(remove,age))
+
+# remove NA rows (2571th onwards)
+fixed_data <- fixed_data[1:2570,] 
+```
+
+
+
+Remove Vietnamese accent
+```{r}
+fixed_data %<>% 
+  apply(2, function(x)stringi::stri_trans_general(x, 'any-ascii')) %>% 
+  as.data.frame()
+  
+```
+
+
+```{r}
+# translate province_home
+fixed_data %<>% 
+  mutate(province_home = tolower(province_home)) %>% 
+  mutate(province_home = recode(province_home, 
+                                   "tphcm"     = "ho chi minh"       , "tp ho chi minh"                   = "ho chi minh" ,
+                                   "vung tau"       = "ba ria vung tau"       , "tp. ho chi minh"                    = "ho chi minh",
+                                   "hoan kiem"          =   "ha noi"    , "ba ria- vung tau"                   = "ba ria vung tau" ,
+                                   "dac lac"    = "dak lak"       , "tp. dien bien phu"               = "dien bien",
+                                   "tp hcm"         = "ho chi minh" , "chi linh"     = "hai duong"          ,
+                                "bac can" = "bac kan", "gia lam" = "ha noi", "hai chau" = "da nang", "hue" = "thua thien hue",
+                                "nha trang" = "khanh hoa", "quang dong" = "quang binh", "binh giang" = "hai duong"
+                                 ))
+```
+
+```{r}
+data_ts <- fixed_data %>% 
+  select(id, starts_with("samplingDate"), starts_with("result"), date_public, startDate_hospitalized, province_home, date_death) %>% 
+  rowwise() %>% 
+  # mutate(PCR1.pos = list(magrittr::extract(c_across(samplingDate1:samplingDate28), first_positive(c_across(result1:result28))))) %>%
+  mutate(PCR1.pos = ifelse(!is.na(result1),magrittr::extract(c_across(samplingDate1:samplingDate28), first_positive(c_across(result1:result28))), NA)) %>%
+  # mutate(date_recover = list(magrittr::extract(c_across(samplingDate1:samplingDate28), last_test(c_across(result1:result28))))) %>%
+  mutate(date_recover = ifelse(!is.na(result1),magrittr::extract(c_across(samplingDate1:samplingDate28), last_test(c_across(result1:result28))), NA)) %>%
+  mutate(date_confirmed = ifelse(is.na(date_public), PCR1.pos, date_public)) %>% 
+ mutate(date_confirmed = ifelse(is.na(date_confirmed), startDate_hospitalized, date_confirmed)) %>% 
+  select(id, date_confirmed, province_home, date_recover, date_death)
+
+# which(is.na(data_ts$province_home))
+
+data_ts <- data_ts[-which(is.na(data_ts$province_home)),]
+
+
+
+condition_subset <- function(x) {
+  data_ts %>% 
+  group_by({{x}}, province_home) %>% 
+  summarise(Cases = n()) %>% 
+  ungroup() %>% 
+  mutate(cum_cases = cumsum(Cases))
+}
+
+
+Cases <- condition_subset(date_confirmed) %>% 
+  rename("DateRep" = "date_confirmed") %>% 
+  ungroup() %>% 
+  mutate(Recover = 0,
+         cum_recover = 0,
+         Death = 0,
+         cum_death =0)
+
+Recover <- condition_subset(date_recover) %>% 
+  rename("DateRep" = "date_recover",
+         "cum_recover" = "cum_cases",
+         "Recover" = "Cases") %>% 
+  ungroup() %>% 
+  mutate(Cases = 0,
+         cum_cases = 0,
+         Death = 0,
+         cum_death =0)
+
+
+Death <- condition_subset(date_death) %>% 
+  rename("DateRep" = "date_death",
+         "cum_death" = "cum_cases",
+         "Death" = "Cases") %>% 
+  ungroup() %>% 
+  mutate(Recover = 0,
+         cum_recover = 0,
+         Cases = 0,
+         cum_cases = 0)
+
+
+
+data <- rbind(Cases, Recover, Death) %>% 
+  rename("Province" = "province_home") %>% 
+  arrange(DateRep) %>% 
+  group_by(DateRep, Province) %>% 
+  transmute(Cases=sum(Cases), 
+            Recovered = sum(Recover),
+            Deaths = sum(Death)) %>% 
+  ungroup() %>% 
+  distinct() %>% 
+  mutate(cum_cases = cumsum(Cases),
+         cum_recovered = cumsum(Recovered),
+         cum_death = cumsum(Deaths)) %>% 
+  filter(!is.na(DateRep))
+
+pull_pop <- function(x) province %>% filter(grepl(x, Province)) %>% pull(Population)
+
+data <- data %>% 
+   mutate(Population = purrr::map_int(Province, pull_pop)) 
+
+
+vietnam <- data %>% 
+  group_by(DateRep) %>% 
+  mutate(Cases = sum(Cases),
+         Deaths = sum(Deaths),
+         Recovered = sum(Recovered)) %>% 
+  select(DateRep, Cases, Recovered, Deaths) %>% 
+  distinct() %>% 
+  ungroup() %>% 
+  mutate(cum_cases = cumsum(Cases),
+         cum_recovered =cumsum(Recovered),
+         cum_death= cumsum(Deaths)) %>% 
+  mutate(Population = as.integer("96462106"))  %>% #as of 2019 
+  mutate(Province = as.character("vietnam"))
+
+
+data <- rbind(data, vietnam) %>% 
+  arrange(DateRep)
+attach(data)
+
+```
+
+
+```{r}
+saveRDS(data,"~/OneDrive - TnS/OUCRU/Covid-19/linelisting_1903/data.rds")
+```
+
+
+
+
+
+
+
+
